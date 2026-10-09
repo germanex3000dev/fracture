@@ -6,6 +6,9 @@ A minimal terminal text editor written in Rust.
 directly in the terminal. It is built on [crossterm] and currently lives in a
 single file (`src/main.rs`).
 
+It may look plain and simple, but keep in mind, this is a first version. There will
+be many features later.
+
 ## Features
 
 - Open an existing file, or start a new buffer by passing a path
