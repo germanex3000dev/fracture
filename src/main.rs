@@ -12,6 +12,30 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const INDENT: usize = 4;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Normal,
+    Insert,
+    Command,
+}
+
+impl Mode {
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Normal => "NORMAL",
+            Mode::Insert => "INSERT",
+            Mode::Command => "COMMAND",
+        }
+    }
+}
+
+fn default_message() -> String {
+    format!("fracture v{VERSION} — press i to insert, : for commands")
+}
+
 struct Terminal;
 
 struct Editor {
@@ -27,14 +51,20 @@ struct Editor {
     path: Option<PathBuf>,
     dirty: bool,
     message: String,
-    quit_warn: bool,
     should_quit: bool,
+    mode: Mode,
+    command: String,
 }
 
 impl Terminal {
     fn init() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
-        execute!(io::stdout(), terminal::EnterAlternateScreen)?;
+
+        if let Err(e) = execute!(io::stdout(), terminal::EnterAlternateScreen) {
+            let _ = terminal::disable_raw_mode();
+            return Err(e);
+        }
+
         Ok(Terminal)
     }
 }
@@ -61,6 +91,7 @@ impl Editor {
         }
 
         let (w, h) = terminal::size()?;
+
         Ok(Editor {
             lines,
             cx: 0,
@@ -71,13 +102,14 @@ impl Editor {
             height: h as usize,
             path,
             dirty: false,
-            message: "Ctrl-S = save | Ctrl-Q = quit".into(),
-            quit_warn: false,
+            message: default_message(),
             should_quit: false,
+            mode: Mode::Normal,
+            command: String::new(),
         })
     }
 
-        fn insert_char(&mut self, c: char) {
+    fn insert_char(&mut self, c: char) {
         self.lines[self.cy].insert(self.cx, c);
         self.cx += 1;
         self.dirty = true;
@@ -90,6 +122,23 @@ impl Editor {
         self.cy += 1;
         self.cx = 0;
         self.dirty = true;
+    }
+
+    /// Insert an empty line below the cursor and drop into Insert mode on it.
+    fn open_line_below(&mut self) {
+        self.lines.insert(self.cy + 1, Vec::new());
+        self.cy += 1;
+        self.cx = 0;
+        self.dirty = true;
+        self.mode = Mode::Insert;
+    }
+
+    /// Insert an empty line above the cursor and drop into Insert mode on it.
+    fn open_line_above(&mut self) {
+        self.lines.insert(self.cy, Vec::new());
+        self.cx = 0;
+        self.dirty = true;
+        self.mode = Mode::Insert;
     }
 
     fn backspace(&mut self) {
@@ -120,7 +169,7 @@ impl Editor {
         }
     }
 
-        fn clamp_cx(&mut self) {
+    fn clamp_cx(&mut self) {
         // after moving up/down, the new line might be shorter
         self.cx = self.cx.min(self.lines[self.cy].len());
     }
@@ -157,6 +206,14 @@ impl Editor {
         }
     }
 
+    fn move_line_start(&mut self) {
+        self.cx = 0;
+    }
+
+    fn move_line_end(&mut self) {
+        self.cx = self.lines[self.cy].len();
+    }
+
     fn page(&mut self, up: bool) {
         let step = self.text_rows();
         for _ in 0..step {
@@ -164,7 +221,7 @@ impl Editor {
         }
     }
 
-        // rows available for text (we reserve 2: status bar + message line)
+    // rows available for text (we reserve 2: status bar + message line)
     fn text_rows(&self) -> usize {
         self.height.saturating_sub(2).max(1)
     }
@@ -187,7 +244,7 @@ impl Editor {
         }
     }
 
-        fn draw(&mut self) -> io::Result<()> {
+    fn draw(&mut self) -> io::Result<()> {
         self.scroll();
         let mut out = io::stdout();
         queue!(out, cursor::Hide, cursor::MoveTo(0, 0))?;
@@ -207,14 +264,15 @@ impl Editor {
             queue!(out, Print("\r\n"))?;
         }
 
-        // 2) status bar
+        // 2) status bar: mode, filename, modified flag, cursor position
         let name = self
             .path
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "[No Name]".into());
         let status = format!(
-            " {}{}  |  line {}/{}  col {}",
+            " -- {} --  {}{}  |  line {}/{}  col {}",
+            self.mode.label(),
             name,
             if self.dirty { " [+]" } else { "" },
             self.cy + 1,
@@ -233,26 +291,45 @@ impl Editor {
             Print("\r\n"),
         )?;
 
-        // 3) message line
-        let msg: String = self.message.chars().take(self.width).collect();
+        // 3) message line — in Command mode this is the ':' prompt we type into
+        let line = if self.mode == Mode::Command {
+            format!(":{}", self.command)
+        } else {
+            self.message.clone()
+        };
+        let total = line.chars().count();
+        let msg: String = if total > self.width {
+            // too long to fit: drop the oldest characters so the tail stays visible
+            line.chars()
+                .skip(total - self.width)
+                .take(self.width)
+                .collect()
+        } else {
+            line
+        };
         queue!(out, terminal::Clear(ClearType::CurrentLine), Print(msg))?;
 
         // 4) put the real cursor where our logical cursor is (file coords -> screen coords)
-        queue!(
-            out,
-            cursor::MoveTo(
-                (self.cx - self.col_off) as u16,
-                (self.cy - self.row_off) as u16
-            ),
-            cursor::Show
-        )?;
+        if self.mode == Mode::Command {
+            queue!(out, cursor::Hide)?; // no text cursor while typing a command
+        } else {
+            queue!(
+                out,
+                cursor::MoveTo(
+                    (self.cx - self.col_off) as u16,
+                    (self.cy - self.row_off) as u16
+                ),
+                cursor::Show
+            )?;
+        }
         out.flush()
     }
 
-        fn save(&mut self) {
+    /// Write the buffer to disk. Returns whether the file was actually written.
+    fn save(&mut self) -> bool {
         let Some(path) = self.path.clone() else {
             self.message = "No filename! Run: fracture <file>".into();
-            return;
+            return false;
         };
         let text = self
             .lines
@@ -264,47 +341,132 @@ impl Editor {
             Ok(_) => {
                 self.dirty = false;
                 self.message = format!("Saved {}", path.display());
+                true
             }
-            Err(e) => self.message = format!("Save failed: {e}"),
+            Err(e) => {
+                self.message = format!("Save failed: {e}");
+                false
+            }
         }
     }
 
-    fn quit(&mut self) {
-        if self.dirty && !self.quit_warn {
-            self.message = "Unsaved changes! Press Ctrl-Q again to quit anyway.".into();
-            self.quit_warn = true;
+    /// Quit the editor. Without `force` a dirty buffer blocks the quit.
+    fn quit(&mut self, force: bool) {
+        if self.dirty && !force {
+            self.message = "No write since last change (use :q! to quit anyway)".into();
         } else {
             self.should_quit = true;
         }
     }
 
-        fn handle_key(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    /// Execute whatever was typed after the ':'.
+    fn run_command(&mut self, raw: &str) {
+        match raw.trim() {
+            "" => {} // bare ':' just leaves command mode
+            "w" => {
+                self.save();
+            }
+            "q" => self.quit(false),
+            "q!" => self.quit(true),
+            // only quit when the write actually landed, otherwise keep the error
+            "wq" | "x" => {
+                if self.save() {
+                    self.quit(false);
+                }
+            }
+            other => self.message = format!("Unknown command: :{other}"),
+        }
+    }
 
-        // any key other than Ctrl-Q cancels the "are you sure" state
-        if !(ctrl && key.code == KeyCode::Char('q')) {
-            self.quit_warn = false;
+    /// Leave Command mode without running anything.
+    fn cancel_command(&mut self) {
+        self.command.clear();
+        self.mode = Mode::Normal;
+        self.message = default_message();
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
+        match self.mode {
+            Mode::Normal => self.normal_key(key),
+            Mode::Insert => self.insert_key(key),
+            Mode::Command => self.command_key(key),
+        }
+    }
+
+    /// Movement keys, shared by Normal and Insert mode.
+    fn move_cursor(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Left => self.move_left(),
+            KeyCode::Right => self.move_right(),
+            KeyCode::Up => self.move_up(),
+            KeyCode::Down => self.move_down(),
+            KeyCode::Home => self.move_line_start(),
+            KeyCode::End => self.move_line_end(),
+            KeyCode::PageUp => self.page(true),
+            KeyCode::PageDown => self.page(false),
+            _ => {}
+        }
+    }
+
+    fn normal_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('i') => self.mode = Mode::Insert,
+            KeyCode::Char('a') => {
+                // insert *after* the cursor, but never wrap onto the next line
+                if self.cx < self.lines[self.cy].len() {
+                    self.cx += 1;
+                }
+                self.mode = Mode::Insert;
+            }
+            KeyCode::Char('A') => {
+                self.move_line_end();
+                self.mode = Mode::Insert;
+            }
+            KeyCode::Char('o') => self.open_line_below(),
+            KeyCode::Char('O') => self.open_line_above(),
+            KeyCode::Char(':') => {
+                self.mode = Mode::Command;
+                self.command.clear();
+            }
+            KeyCode::Backspace => self.backspace(),
+            KeyCode::Delete => self.delete(),
+            code => self.move_cursor(code),
+        }
+    }
+
+    fn insert_key(&mut self, key: KeyEvent) {
+        // never let Ctrl-<key> slip in as a literal character
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return;
         }
 
-        match (key.code, ctrl) {
-            (KeyCode::Char('q'), true) => self.quit(),
-            (KeyCode::Char('s'), true) => self.save(),
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Char(c) => self.insert_char(c),
+            KeyCode::Enter => self.insert_newline(),
+            KeyCode::Tab => (0..INDENT).for_each(|_| self.insert_char(' ')),
+            KeyCode::Backspace => self.backspace(),
+            KeyCode::Delete => self.delete(),
+            code => self.move_cursor(code),
+        }
+    }
 
-            (KeyCode::Char(c), false) => self.insert_char(c),
-            (KeyCode::Tab, _) => (0..4).for_each(|_| self.insert_char(' ')),
-            (KeyCode::Enter, _) => self.insert_newline(),
-            (KeyCode::Backspace, _) => self.backspace(),
-            (KeyCode::Delete, _) => self.delete(),
+    fn command_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return;
+        }
 
-            (KeyCode::Left, _) => self.move_left(),
-            (KeyCode::Right, _) => self.move_right(),
-            (KeyCode::Up, _) => self.move_up(),
-            (KeyCode::Down, _) => self.move_down(),
-            (KeyCode::Home, _) => self.cx = 0,
-            (KeyCode::End, _) => self.cx = self.lines[self.cy].len(),
-            (KeyCode::PageUp, _) => self.page(true),
-            (KeyCode::PageDown, _) => self.page(false),
-
+        match key.code {
+            KeyCode::Esc => self.cancel_command(),
+            KeyCode::Enter => {
+                let command = std::mem::take(&mut self.command);
+                self.mode = Mode::Normal;
+                self.run_command(&command);
+            }
+            KeyCode::Backspace => {
+                self.command.pop();
+            }
+            KeyCode::Char(c) => self.command.push(c),
             _ => {}
         }
     }
